@@ -16,9 +16,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Prefer tools over prose."""
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 # todo manager: 结构化状态，LLM写入
 class TodoManager:
@@ -67,10 +66,13 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
+    # Parent-only tool: delegate work in a fresh context.
+    # The model should provide `prompt`, but we defensively handle missing input.
+    "task":       lambda **kw: run_subagent(kw.get("prompt") or "Error: task requires 'prompt'."),
 }
 
 
-TOOLS = [
+CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -85,6 +87,38 @@ TOOLS = [
 
 
 TODO = TodoManager()
+
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    for _ in range(30):  # safety limit
+        response = client.messages.create(
+            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
+            tools=CHILD_TOOLS, max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        sub_messages.append({"role": "user", "content": results})
+    # Only the final text returns to the parent -- child context is discarded
+    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+
+
+# -- Parent tools: base tools + task dispatcher --
+PARENT_TOOLS = CHILD_TOOLS + [
+    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+]
+
+# Parent loop uses this toolset (base tools + `task` dispatcher).
+TOOLS = PARENT_TOOLS
+
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -174,7 +208,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
